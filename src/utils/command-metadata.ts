@@ -1,0 +1,270 @@
+import type { CatalogOption } from './command-catalog';
+import { LICELL_COMMAND_MANIFEST } from '../commands/registry';
+import type {
+  CommandActionHint,
+  CommandTaskPhase,
+  CommandTaskHint,
+  CommandDescriptor,
+  CommandDescriptorMap,
+  CommandFlowStep,
+  CommandInteractionDescriptor,
+  CommandOptionInsight,
+  CommandResultDescriptor,
+  CommandResultFieldDescriptor,
+  CommandSafetyLevel,
+  CommandSafetyMetadata,
+  CommandSectionConfig,
+  CommandAutomationDescriptor
+} from '../commands/module';
+
+export type {
+  CommandActionHint,
+  CommandTaskPhase,
+  CommandTaskHint,
+  CommandDescriptor,
+  CommandDescriptorMap,
+  CommandFlowStep,
+  CommandInteractionDescriptor,
+  CommandOptionInsight,
+  CommandResultDescriptor,
+  CommandResultFieldDescriptor,
+  CommandSafetyLevel,
+  CommandSafetyMetadata,
+  CommandSectionConfig,
+  CommandAutomationDescriptor
+} from '../commands/module';
+
+export interface ResolvedCommandResultFieldDescriptor {
+  name: string;
+  description: string;
+  required: boolean;
+}
+
+export interface ResolvedCommandResultFieldTreeNode {
+  name: string;
+  segment: string;
+  description?: string;
+  required?: boolean;
+  children: ResolvedCommandResultFieldTreeNode[];
+}
+
+export interface ResolvedCommandResultDescriptor {
+  summary?: string;
+  outcomeKey?: string;
+  fields: ResolvedCommandResultFieldDescriptor[];
+  fieldTree: ResolvedCommandResultFieldTreeNode[];
+}
+
+function unique<T>(values: T[]) {
+  return [...new Set(values)];
+}
+
+function getCommandManifest() {
+  return LICELL_COMMAND_MANIFEST;
+}
+
+function buildCommandSectionConfig(): CommandSectionConfig[] {
+  const sections: CommandSectionConfig[] = [];
+  const indexById = new Map<string, number>();
+
+  for (const module of getCommandManifest().modules) {
+    const existingIndex = indexById.get(module.section.id);
+    if (existingIndex === undefined) {
+      indexById.set(module.section.id, sections.length);
+      sections.push({
+        id: module.section.id,
+        title: module.section.title,
+        roots: [...module.roots],
+        summary: module.section.summary,
+        notes: [...(module.section.notes || [])],
+        taskHints: (module.section.taskHints || []).map((task) => ({ ...task, commands: [...(task.commands || [])] }))
+      });
+      continue;
+    }
+
+    const current = sections[existingIndex]!;
+    current.roots = unique([...current.roots, ...module.roots]);
+  }
+
+  return sections;
+}
+
+let cachedCommandSectionConfig: CommandSectionConfig[] | undefined;
+
+export function getCommandSectionConfig(): CommandSectionConfig[] {
+  if (!cachedCommandSectionConfig) {
+    cachedCommandSectionConfig = buildCommandSectionConfig();
+  }
+
+  return cachedCommandSectionConfig.map((section) => ({
+    ...section,
+    roots: [...section.roots],
+    notes: [...(section.notes || [])],
+    taskHints: (section.taskHints || []).map((task) => ({ ...task, commands: [...(task.commands || [])] }))
+  }));
+}
+
+function buildResolvedCommandDescriptors() {
+  const manifest = getCommandManifest();
+  const registryCommandDescriptors: Record<string, CommandDescriptor> = Object.assign(
+    {},
+    ...manifest.modules.map((module) => module.descriptors)
+  );
+
+  return {
+    ...manifest.root.descriptors,
+    ...registryCommandDescriptors
+  } satisfies Record<string, CommandDescriptor>;
+}
+
+let cachedResolvedCommandDescriptors: Record<string, CommandDescriptor> | undefined;
+
+function getResolvedCommandDescriptors() {
+  if (!cachedResolvedCommandDescriptors) {
+    cachedResolvedCommandDescriptors = buildResolvedCommandDescriptors();
+  }
+
+  return cachedResolvedCommandDescriptors;
+}
+
+const EMPTY_COMMAND_DESCRIPTOR: CommandDescriptor = {};
+
+export function getCommandDescriptor(key: string): CommandDescriptor {
+  return getResolvedCommandDescriptors()[key] || EMPTY_COMMAND_DESCRIPTOR;
+}
+
+function splitResultFieldPath(name: string) {
+  return name.trim().split('.').map((segment) => segment.trim()).filter(Boolean);
+}
+
+function normalizeResultFieldSegment(segment: string) {
+  return segment.replace(/\[\]$/, '');
+}
+
+export function buildCommandResultFieldTree(fields: ResolvedCommandResultFieldDescriptor[]) {
+  const roots: ResolvedCommandResultFieldTreeNode[] = [];
+  const nodes = new Map<string, ResolvedCommandResultFieldTreeNode>();
+
+  for (const field of fields) {
+    const segments = splitResultFieldPath(field.name);
+    let children = roots;
+    let canonicalPath = '';
+
+    for (const [index, segment] of segments.entries()) {
+      const normalizedSegment = normalizeResultFieldSegment(segment);
+      canonicalPath = canonicalPath ? `${canonicalPath}.${normalizedSegment}` : normalizedSegment;
+      let node = nodes.get(canonicalPath);
+      if (!node) {
+        node = {
+          name: canonicalPath,
+          segment,
+          children: []
+        };
+        nodes.set(canonicalPath, node);
+        children.push(node);
+      } else if (segment.endsWith('[]') && !node.segment.endsWith('[]')) {
+        node.segment = segment;
+      }
+
+      if (index === segments.length - 1) {
+        node.description = field.description;
+        node.required = field.required;
+      }
+
+      children = node.children;
+    }
+  }
+
+  const finalizeTree = (items: ResolvedCommandResultFieldTreeNode[], parentPath = ''): ResolvedCommandResultFieldTreeNode[] => (
+    items.map((item) => {
+      const name = parentPath ? `${parentPath}.${item.segment}` : item.segment;
+      return {
+        ...item,
+        name,
+        children: finalizeTree(item.children, name)
+      };
+    })
+  );
+
+  return finalizeTree(roots);
+}
+
+export function cloneResolvedCommandResultDescriptor(result?: ResolvedCommandResultDescriptor) {
+  if (!result) return undefined;
+
+  const cloneFieldTreeNode = (node: ResolvedCommandResultFieldTreeNode): ResolvedCommandResultFieldTreeNode => ({
+    ...node,
+    children: node.children.map(cloneFieldTreeNode)
+  });
+
+  return {
+    ...result,
+    fields: result.fields.map((field) => ({ ...field })),
+    fieldTree: result.fieldTree.map(cloneFieldTreeNode)
+  } satisfies ResolvedCommandResultDescriptor;
+}
+
+export function buildCommandResultDescriptor(descriptor: CommandDescriptor): ResolvedCommandResultDescriptor | undefined {
+  if (!descriptor.result) return undefined;
+  const fields = (descriptor.result.fields || []).map((field) => ({
+    name: field.name,
+    description: field.description,
+    required: field.required !== false
+  }));
+  return {
+    summary: descriptor.result.summary,
+    outcomeKey: descriptor.result.outcomeKey,
+    fields,
+    fieldTree: buildCommandResultFieldTree(fields)
+  };
+}
+
+export function buildCommandOptionInsights(options: Pick<CatalogOption, 'rawName' | 'flags'>[], descriptor: CommandDescriptor) {
+  const configured = descriptor.optionInsights || {};
+  const configuredFlags = Object.keys(configured);
+  if (configuredFlags.length === 0) return [] as CommandOptionInsight[];
+
+  const insights: CommandOptionInsight[] = [];
+  const seen = new Set<string>();
+
+  for (const option of options) {
+    const matchedFlag = option.flags.find((flag) => configured[flag]);
+    if (!matchedFlag) continue;
+    const meta = configured[matchedFlag]!;
+    insights.push({
+      flag: option.rawName,
+      whenToUse: meta.whenToUse,
+      cautions: [...(meta.cautions || [])]
+    });
+    seen.add(matchedFlag);
+  }
+
+  for (const flag of configuredFlags) {
+    if (seen.has(flag)) continue;
+    const meta = configured[flag]!;
+    insights.push({
+      flag,
+      whenToUse: meta.whenToUse,
+      cautions: [...(meta.cautions || [])]
+    });
+  }
+
+  return insights;
+}
+
+export function buildExplicitRecommendedFlow(descriptor: CommandDescriptor) {
+  return (descriptor.recommendedFlow || []).map((step) => ({
+    title: step.title,
+    command: step.command,
+    reason: step.reason
+  }));
+}
+
+export function buildCommandSafetyMetadata(descriptor: CommandDescriptor) {
+  if (!descriptor.safety?.level || !descriptor.safety.reason) return undefined;
+  return {
+    level: descriptor.safety.level,
+    reason: descriptor.safety.reason,
+    confirmFlags: [...(descriptor.safety.confirmFlags || [])]
+  } satisfies CommandSafetyMetadata;
+}
